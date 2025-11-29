@@ -16,9 +16,7 @@ import requests
 import streamlit as st
 from smbus2 import SMBus
 
-# ============================================================
 #                 COMMON CONFIG
-# ============================================================
 
 ROBOFLOW_API_KEY = "BtzrtfhjiBcQCBwgRanJ"
 ROBOFLOW_BASE_URL = "https://detect.roboflow.com"
@@ -26,9 +24,7 @@ ROBOFLOW_BASE_URL = "https://detect.roboflow.com"
 FISH_MODEL_ID = "fish-detection-wqhuw/2"
 MINT_MODEL_ID = "mint-yo73o/2"
 
-# ============================================================
 #                 pH SENSOR (ADS1115)
-# ============================================================
 
 I2C_ADDRESS = 0x48
 REG_CONVERSION = 0x00
@@ -76,9 +72,8 @@ def voltage_to_ph(voltage):
     return SLOPE * voltage + INTERCEPT
 
 
-# ============================================================
 #                 LIGHT SENSOR (BH1750)
-# ============================================================
+
 
 BH1750_ADDR = 0x23
 POWER_ON = 0x01
@@ -99,9 +94,8 @@ def bh1750_read_lux(bus):
     return lux
 
 
-# ============================================================
 #                 ROBOFLOW THREADED MONITOR
-# ============================================================
+
 
 FRAME_WIDTH = 640           # camera output width
 INFER_EVERY_SECONDS = 1.0   # how often to call API (>= 0.7 recommended)
@@ -251,7 +245,6 @@ page = st.sidebar.radio(
     ["Sensor Dashboard", "Fish Monitor", "Plant (Mint) Monitor"],
 )
 
-# Keep sensor history
 if "sensor_history" not in st.session_state:
     st.session_state.sensor_history = []
 
