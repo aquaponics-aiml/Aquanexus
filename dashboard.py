@@ -1,321 +1,456 @@
-# dashboard.py
-#
-# Streamlit dashboard for:
-# 1) Sensor Dashboard (pH + light)
-# 2) Fish Monitor (real-time threaded Roboflow inference)
-# 3) Plant/Mint Monitor (real-time threaded Roboflow inference)
-
-import threading
-import time
-import statistics
-from datetime import datetime
-
-import cv2
-import pandas as pd
-import requests
 import streamlit as st
-from smbus2 import SMBus
+import pandas as pd
+from datetime import datetime, timedelta
 
-# ============================================================
-#                 COMMON CONFIG
-# ============================================================
-
-ROBOFLOW_API_KEY = "BtzrtfhjiBcQCBwgRanJ"
-ROBOFLOW_BASE_URL = "https://detect.roboflow.com"
-
-FISH_MODEL_ID = "fish-detection-wqhuw/2"
-MINT_MODEL_ID = "mint-yo73o/2"
-
-# ============================================================
-#                 pH SENSOR (ADS1115)
-# ============================================================
-
-I2C_ADDRESS = 0x48
-REG_CONVERSION = 0x00
-REG_CONFIG = 0x01
-CONFIG_TEMPLATE = 0x8583
-DIVIDER_SCALING = 0.6
-
-V7 = 2.512
-V4 = 3.026
-SLOPE = (4.00 - 7.00) / (V4 - V7)
-INTERCEPT = 7.00 - SLOPE * V7
-
-
-def read_adc(bus, channel=0):
-    mux = {0: 0x4000, 1: 0x5000, 2: 0x6000, 3: 0x7000}[channel]
-    config = (CONFIG_TEMPLATE & ~0x7000) | mux
-    bus.write_i2c_block_data(
-        I2C_ADDRESS,
-        REG_CONFIG,
-        [(config >> 8) & 0xFF, config & 0xFF],
-    )
-    time.sleep(0.12)
-    data = bus.read_i2c_block_data(I2C_ADDRESS, REG_CONVERSION, 2)
-    raw = (data[0] << 8) | data[1]
-    if raw > 0x7FFF:
-        raw -= 0x10000
-    return raw
-
-
-def read_voltage(bus, channel=0):
-    raw = read_adc(bus, channel)
-    measured = raw * 4.096 / 32768.0
-    actual = measured * DIVIDER_SCALING
-    return actual
-
-
-def get_filtered_voltage(bus, channel=0, samples=10, delay=0.05):
-    readings = [read_voltage(bus, channel) for _ in range(samples)]
-    time.sleep(delay)
-    return statistics.median(readings)
-
-
-def voltage_to_ph(voltage):
-    return SLOPE * voltage + INTERCEPT
-
-
-# ============================================================
-#                 LIGHT SENSOR (BH1750)
-# ============================================================
-
-BH1750_ADDR = 0x23
-POWER_ON = 0x01
-CONT_HIGH_RES_MODE = 0x10
-
-
-def bh1750_init(bus):
-    bus.write_byte(BH1750_ADDR, POWER_ON)
-    time.sleep(0.1)
-    bus.write_byte(BH1750_ADDR, CONT_HIGH_RES_MODE)
-    time.sleep(0.2)
-
-
-def bh1750_read_lux(bus):
-    data = bus.read_i2c_block_data(BH1750_ADDR, CONT_HIGH_RES_MODE, 2)
-    raw = (data[0] << 8) | data[1]
-    lux = raw / 1.2
-    return lux
-
-
-# ============================================================
-#                 ROBOFLOW THREADED MONITOR
-# ============================================================
-
-FRAME_WIDTH = 640
-INFER_EVERY_SECONDS = 1.0
-
-
-def roboflow_threaded_monitor(model_id: str, window_name: str):
-    latest_predictions = []
-    latest_error = None
-    infer_busy = False
-    lock = threading.Lock()
-
-    def call_roboflow(frame_small):
-        nonlocal latest_predictions, latest_error, infer_busy
-        try:
-            ok, encoded = cv2.imencode(".jpg", frame_small)
-            if not ok:
-                raise RuntimeError("Failed to encode frame")
-
-            img_bytes = encoded.tobytes()
-
-            response = requests.post(
-                f"{ROBOFLOW_BASE_URL}/{model_id}",
-                params={"api_key": ROBOFLOW_API_KEY},
-                files={"file": ("frame.jpg", img_bytes, "image/jpeg")},
-                timeout=20,
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"API Error {response.status_code}: {response.text[:150]}"
-                )
-
-            preds = response.json().get("predictions", [])
-
-            with lock:
-                latest_predictions = preds
-                latest_error = None
-
-        except Exception as e:
-            with lock:
-                latest_error = str(e)
-                latest_predictions = []
-        finally:
-            infer_busy = False
-
-    def draw_predictions(frame, predictions, error_text=None):
-        for pred in predictions:
-            x, y = int(pred["x"]), int(pred["y"])
-            w, h = int(pred["width"]), int(pred["height"])
-            label = pred.get("class", "object")
-            conf = pred.get("confidence", 0)
-
-            x1, y1 = x - w // 2, y - h // 2
-            x2, y2 = x + w // 2, y + h // 2
-
-            color = (0, 255, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                frame,
-                f"{label} ({conf:.2f})",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-            )
-
-        msg = "OK" if error_text is None else error_text
-        color = (0, 255, 0) if error_text is None else (0, 0, 255)
-
-        cv2.rectangle(frame, (5, 5), (600, 30), (0, 0, 0), -1)
-        cv2.putText(
-            frame,
-            msg,
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-        )
-        return frame
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.error("Could not open webcam. Check connection.")
-        return
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_WIDTH * 3 // 4)
-
-    print("Camera opened for model:", model_id)
-    print("Press 'q' in the camera window to quit.")
-
-    last_infer_time = 0.0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to read frame")
-            continue
-
-        h, w = frame.shape[:2]
-        scale = 416 / max(h, w)
-        frame_small = cv2.resize(frame, (int(w * scale), int(h * scale))) if scale < 1 else frame
-
-        now = time.time()
-        if (now - last_infer_time >= INFER_EVERY_SECONDS) and not infer_busy:
-            infer_busy = True
-            last_infer_time = now
-            threading.Thread(target=call_roboflow, args=(frame_small,), daemon=True).start()
-
-        with lock:
-            preds_copy = list(latest_predictions)
-            err_copy = latest_error
-
-        annotated = draw_predictions(frame.copy(), preds_copy, err_copy)
-        cv2.imshow(window_name, annotated)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
-# ============================================================
-#                 STREAMLIT UI
-# ============================================================
-
-st.set_page_config(page_title="Aquaponics Dashboard", layout="wide")
-
-st.sidebar.title("Aquaponics Panel")
-page = st.sidebar.radio(
-    "Select a page:",
-    ["Sensor Dashboard", "Fish Monitor", "Plant (Mint) Monitor"],
+# -------------------------------------------------
+# Page Config
+# -------------------------------------------------
+st.set_page_config(
+    page_title="Aquaponics — Preview",
+    layout="wide",
 )
 
-if "sensor_history" not in st.session_state:
-    st.session_state.sensor_history = []
+# -------------------------------------------------
+# Custom CSS for pretty UI
+# -------------------------------------------------
+st.markdown(
+    """
+    <style>
+    /* Global background + font */
+    .stApp {
+        background: linear-gradient(135deg, #dff8ff 0%, #f6fff7 40%, #ffffff 100%);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #0f172a;
+    }
 
+    /* Top bar */
+    .top-bar {
+        background: linear-gradient(90deg, #7ee6ff, #4ade80);
+        border-radius: 24px;
+        padding: 18px 26px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        box-shadow: 0 18px 30px rgba(15, 23, 42, 0.13);
+        margin-bottom: 28px;
+    }
 
-def page_sensor_dashboard():
-    st.title("Sensor Dashboard")
-    st.caption("Live pH and light readings from Raspberry Pi (ADS1115 + BH1750).")
+    .brand-left {
+        display: flex;
+        align-items: flex-start;
+        gap: 14px;
+    }
 
-    max_points = st.sidebar.slider(
-        "Max points in chart history", 20, 300, 100, key="max_points"
+    .brand-icon {
+        width: 40px;
+        height: 40px;
+        border-radius: 999px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #ecfeff;
+        font-size: 22px;
+    }
+
+    .brand-title {
+        font-weight: 800;
+        font-size: 20px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #065f46;
+    }
+
+    .brand-subtitle {
+        font-size: 13px;
+        color: #064e3b;
+    }
+
+    .top-buttons {
+        display: flex;
+        gap: 10px;
+    }
+
+    .pill-btn {
+        border: none;
+        border-radius: 999px;
+        padding: 8px 18px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.18);
+    }
+
+    .pill-primary {
+        background: linear-gradient(90deg, #22c55e, #14b8a6);
+        color: white;
+    }
+
+    .pill-secondary {
+        background: white;
+        color: #047857;
+    }
+
+    /* Section wrappers */
+    .panel {
+        background: rgba(255, 255, 255, 0.8);
+        border-radius: 28px;
+        padding: 28px 26px 22px;
+        box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+        margin-bottom: 26px;
+    }
+
+    /* Summary metrics cards */
+    .summary-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        margin-top: 18px;
+    }
+
+    .summary-card {
+        background: white;
+        border-radius: 18px;
+        padding: 16px 18px;
+        min-width: 180px;
+        box-shadow: 0 12px 26px rgba(15, 23, 42, 0.06);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .summary-label {
+        font-size: 13px;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+
+    .summary-value {
+        font-size: 26px;
+        font-weight: 800;
+        color: #0f172a;
+    }
+
+    .summary-sub {
+        font-size: 13px;
+        color: #0f766e;
+        font-weight: 600;
+    }
+
+    /* Sensor cards */
+    .sensor-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+        gap: 18px;
+        margin-top: 18px;
+    }
+
+    .sensor-card {
+        background: white;
+        border-radius: 20px;
+        padding: 18px 18px 14px;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .sensor-badge {
+        position: absolute;
+        right: 14px;
+        top: 14px;
+        background: #dcfce7;
+        color: #16a34a;
+        font-size: 11px;
+        font-weight: 700;
+        border-radius: 999px;
+        padding: 4px 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+
+    .sensor-title {
+        font-size: 13px;
+        color: #64748b;
+        margin-bottom: 4px;
+    }
+
+    .sensor-value {
+        font-size: 28px;
+        font-weight: 800;
+        color: #0f172a;
+    }
+
+    .sensor-unit {
+        font-size: 13px;
+        color: #94a3b8;
+        margin-left: 4px;
+    }
+
+    .sensor-bar {
+        margin-top: 12px;
+        height: 7px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #22c55e, #0ea5e9, #818cf8);
+    }
+
+    /* Health panels */
+    .health-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        margin-bottom: 6px;
+    }
+
+    .health-title {
+        font-size: 20px;
+        font-weight: 800;
+        color: #0f172a;
+    }
+
+    .health-sub {
+        font-size: 13px;
+        color: #64748b;
+    }
+
+    .tag-healthy {
+        font-size: 13px;
+        color: #0f766e;
+        font-weight: 700;
+    }
+
+    .soft-btn-row {
+        display: flex;
+        gap: 10px;
+        margin-top: 10px;
+        margin-bottom: 14px;
+    }
+
+    .soft-btn {
+        border-radius: 999px;
+        padding: 6px 16px;
+        border: none;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+    }
+
+    .soft-btn-primary {
+        background: linear-gradient(90deg, #22c55e, #06b6d4);
+        color: white;
+    }
+
+    .soft-btn-outline {
+        background: white;
+        color: #0f172a;
+    }
+
+    .health-time {
+        font-size: 11px;
+        color: #94a3b8;
+        margin-bottom: 10px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------------------------------------
+# Fake time-series data for charts (static)
+# -------------------------------------------------
+now = datetime.now()
+time_points = [now - timedelta(hours=h) for h in [20, 16, 12, 8, 4, 0]]
+
+fish_scores = [94, 96, 95, 96, 97, 98]
+plant_scores = [92, 93, 94, 93, 95, 96]
+
+fish_df = pd.DataFrame({"Time": time_points, "Health": fish_scores}).set_index("Time")
+plant_df = pd.DataFrame({"Time": time_points, "Health": plant_scores}).set_index("Time")
+
+# -------------------------------------------------
+# Top bar
+# -------------------------------------------------
+st.markdown(
+    """
+    <div class="top-bar">
+        <div class="brand-left">
+            <div class="brand-icon">💧</div>
+            <div>
+                <div class="brand-title">AQUAPONICS — PREVIEW</div>
+                <div class="brand-subtitle">Realtime ecosystem monitoring • AI-assisted insights</div>
+            </div>
+        </div>
+        <div class="top-buttons">
+            <button class="pill-btn pill-primary">Preview Dark</button>
+            <button class="pill-btn pill-secondary">Logout</button>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------------------------------------
+# Hero + top metrics
+# -------------------------------------------------
+st.markdown(
+    """
+    <div class="panel">
+        <h1 style="font-size: 34px; font-weight: 800; margin-bottom: 4px; color:#0f172a;">
+            Sustainable Aquaponics
+        </h1>
+        <p style="font-size: 14px; color:#64748b; max-width: 640px;">
+            Symbiotic cycle: fish → nutrient-rich water → plants. This dashboard visualizes the living system
+            and alerts you when parameters drift.
+        </p>
+
+        <div class="summary-row">
+            <div class="summary-card">
+                <div class="summary-label">Fish Count</div>
+                <div class="summary-value">12</div>
+                <div class="summary-sub">Tank A · Live</div>
+            </div>
+
+            <div class="summary-card">
+                <div class="summary-label">Plant Status</div>
+                <div class="summary-value">Fresh</div>
+                <div class="summary-sub">Mint & leafy greens</div>
+            </div>
+
+            <div class="summary-card">
+                <div class="summary-label">System Health</div>
+                <div class="summary-value">98%</div>
+                <div class="summary-sub">AI-assessed · Stable</div>
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------------------------------------
+# Sensor cards (static values)
+# -------------------------------------------------
+st.markdown(
+    """
+    <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h2 style="font-size: 20px; font-weight: 800; margin: 0;">Water & Environment</h2>
+            <span style="font-size:13px; color:#94a3b8;">All values simulated · Demo view</span>
+        </div>
+
+        <div class="sensor-grid">
+            <div class="sensor-card">
+                <div class="sensor-badge">Optimal</div>
+                <div class="sensor-title">pH Level</div>
+                <div>
+                    <span class="sensor-value">7.39</span>
+                    <span class="sensor-unit">pH</span>
+                </div>
+                <div class="sensor-bar"></div>
+            </div>
+
+            <div class="sensor-card">
+                <div class="sensor-badge">Optimal</div>
+                <div class="sensor-title">Turbidity</div>
+                <div>
+                    <span class="sensor-value">15</span>
+                    <span class="sensor-unit">NTU</span>
+                </div>
+                <div class="sensor-bar"></div>
+            </div>
+
+            <div class="sensor-card">
+                <div class="sensor-badge">Optimal</div>
+                <div class="sensor-title">Humidity</div>
+                <div>
+                    <span class="sensor-value">71</span>
+                    <span class="sensor-unit">%</span>
+                </div>
+                <div class="sensor-bar"></div>
+            </div>
+
+            <div class="sensor-card">
+                <div class="sensor-badge">Optimal</div>
+                <div class="sensor-title">Light Intensity</div>
+                <div>
+                    <span class="sensor-value">864</span>
+                    <span class="sensor-unit">lux</span>
+                </div>
+                <div class="sensor-bar"></div>
+            </div>
+
+            <div class="sensor-card">
+                <div class="sensor-badge">Optimal</div>
+                <div class="sensor-title">Temperature</div>
+                <div>
+                    <span class="sensor-value">23.3</span>
+                    <span class="sensor-unit">°C</span>
+                </div>
+                <div class="sensor-bar"></div>
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------------------------------------
+# Fish & Plant health charts (static)
+# -------------------------------------------------
+col_fish, col_plant = st.columns(2)
+
+with col_fish:
+    st.markdown(
+        """
+        <div class="panel">
+            <div class="health-header">
+                <div>
+                    <div class="health-title">Fish Health & Activity</div>
+                    <div class="health-sub">
+                        AI vision indicates: <span class="tag-healthy">Healthy (94.2% confidence)</span>
+                    </div>
+                </div>
+            </div>
+            <div class="soft-btn-row">
+                <button class="soft-btn soft-btn-primary">Run Scan</button>
+                <button class="soft-btn soft-btn-outline">Download Report</button>
+            </div>
+            <div class="health-time">
+                Last checked: {time}
+            </div>
+        """.format(
+            time=now.strftime("%I:%M:%S %p")
+        ),
+        unsafe_allow_html=True,
     )
 
-    try:
-        with SMBus(1) as bus:
-            bh1750_init(bus)
-            voltage = get_filtered_voltage(bus, channel=0)
-            ph_value = voltage_to_ph(voltage)
-            lux = bh1750_read_lux(bus)
-            scaled_lux = lux * 1000
-    except Exception as e:
-        st.error(f"Error reading sensors: {e}")
-        return
+    st.line_chart(fish_df, height=220)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    now = datetime.now().strftime("%H:%M:%S")
-
-    st.session_state.sensor_history.append(
-        {"time": now, "pH": ph_value, "voltage": voltage, "light_lux": scaled_lux}
+with col_plant:
+    st.markdown(
+        """
+        <div class="panel">
+            <div class="health-header">
+                <div>
+                    <div class="health-title">Plant Health & Growth</div>
+                    <div class="health-sub">
+                        AI vision indicates: <span class="tag-healthy">Fresh (91.8% confidence)</span>
+                    </div>
+                </div>
+            </div>
+            <div class="soft-btn-row">
+                <button class="soft-btn soft-btn-primary">Run Scan</button>
+                <button class="soft-btn soft-btn-outline">Download Report</button>
+            </div>
+            <div class="health-time">
+                Last checked: {time}
+            </div>
+        """.format(
+            time=now.strftime("%I:%M:%S %p")
+        ),
+        unsafe_allow_html=True,
     )
 
-    if len(st.session_state.sensor_history) > max_points:
-        st.session_state.sensor_history = st.session_state.sensor_history[-max_points:]
-
-    df = pd.DataFrame(st.session_state.sensor_history)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Current pH", f"{ph_value:.2f}")
-    col2.metric("Sensor Voltage (V)", f"{voltage:.3f}")
-    col3.metric("Light Intensity (lux)", f"{scaled_lux:.0f}")
-
-    st.markdown("---")
-
-    if not df.empty:
-        df_indexed = df.set_index("time")
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.subheader("pH Over Time")
-            st.line_chart(df_indexed[["pH"]])
-
-        with c2:
-            st.subheader("Light Intensity Over Time")
-            st.line_chart(df_indexed[["light_lux"]])
-
-        st.subheader("Recent Readings")
-        st.dataframe(df.tail(20), use_container_width=True)
-
-    st.info("Click Rerun or refresh to update values.")
-
-
-def page_fish_monitor():
-    st.title("Fish Monitor")
-    st.caption("Opens a camera window for real-time Roboflow detection.")
-
-    if st.button("Start fish monitoring"):
-        roboflow_threaded_monitor(FISH_MODEL_ID, "Fish Monitor")
-
-
-def page_mint_monitor():
-    st.title("Plant (Mint) Monitor")
-    st.caption("Opens a camera window for real-time plant health detection.")
-
-    if st.button("Start mint monitoring"):
-        roboflow_threaded_monitor(MINT_MODEL_ID, "Mint Monitor")
-
-
-if page == "Sensor Dashboard":
-    page_sensor_dashboard()
-elif page == "Fish Monitor":
-    page_fish_monitor()
-else:
-    page_mint_monitor()
+    st.line_chart(plant_df, height=220)
+    st.markdown("</div>", unsafe_allow_html=True)
